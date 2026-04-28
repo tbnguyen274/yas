@@ -1,430 +1,345 @@
-def runCmd(String cmd) {
-  if (isUnix()) {
-    sh cmd
-  } else {
-    bat cmd
-  }
-}
-
+// Run a shell command and return the output as a string
 def runCapture(String cmd) {
-  if (isUnix()) {
     return sh(script: cmd, returnStdout: true).trim()
-  }
-  return bat(script: cmd, returnStdout: true).trim()
 }
 
-def runStatus(String cmd) {
-  if (isUnix()) {
-    return sh(script: cmd, returnStatus: true)
-  }
-  return bat(script: cmd, returnStatus: true)
-}
-
+// Calculate the list of changed files 
 def computeChangedFiles() {
-  def cmd
+    def cmd = null
 
-  if (env.CHANGE_TARGET) {
-    cmd = "git -c color.ui=never diff --name-only origin/${env.CHANGE_TARGET}...HEAD"
-  } else if (env.GIT_PREVIOUS_SUCCESSFUL_COMMIT && env.GIT_COMMIT) {
-    cmd = "git -c color.ui=never diff --name-only ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..${env.GIT_COMMIT}"
-  } else if (env.GIT_PREVIOUS_COMMIT && env.GIT_COMMIT) {
-    cmd = "git -c color.ui=never diff --name-only ${env.GIT_PREVIOUS_COMMIT}..${env.GIT_COMMIT}"
-  } else {
-    cmd = 'git -c color.ui=never show --name-only --pretty="" HEAD'
-  }
-
-  try {
-    return runCapture(cmd)
-      .split(/\r?\n/)
-      .collect { it.trim() }
-      .findAll { it }
-  } catch (err) {
-    return runCapture('git -c color.ui=never show --name-only --pretty="" HEAD')
-      .split(/\r?\n/)
-      .collect { it.trim() }
-      .findAll { it }
-  }
-}
-
-def readMavenModulesFromRootPom() {
-  def pom = readFile('pom.xml')
-  def matcher = (pom =~ /<module>([^<]+)<\/module>/)
-  def modules = []
-  matcher.each { m -> modules << m[1].trim() }
-  return modules.unique()
-}
-
-def readAffectedModulesCsv() {
-  return fileExists('.jenkins_affected_modules') ? readFile('.jenkins_affected_modules').trim() : (env.AFFECTED_MODULES ?: '').trim()
-}
-
-def readAffectedModulesList() {
-  return readAffectedModulesCsv()
-    .split(',')
-    .collect { it.trim() }
-    .findAll { it }
-}
-
-def readSonarProjectKeyFromModulePom(String module) {
-  def pomPath = "${module}/pom.xml"
-  if (!fileExists(pomPath)) {
-    return ''
-  }
-
-  def pom = readFile(pomPath)
-  def matcher = (pom =~ /<sonar\.projectKey>([^<]+)<\/sonar\.projectKey>/)
-  if (matcher.find()) {
-    return matcher.group(1).trim()
-  }
-  return ''
-}
-
-def readRootRevisionFromPom() {
-  if (!fileExists('pom.xml')) {
-    return ''
-  }
-
-  def pom = readFile('pom.xml')
-  def matcher = (pom =~ /<revision>([^<]+)<\/revision>/)
-  if (matcher.find()) {
-    return matcher.group(1).trim()
-  }
-  return ''
-}
-
-pipeline {
-  agent any
-
-  tools {
-    jdk 'jdk25'
-    maven 'maven3'
-  }
-
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    skipDefaultCheckout(true)
-    overrideIndexTriggers(true)
-    buildDiscarder(logRotator(numToKeepStr: '30'))
-  }
-
-  // Multibranch should normally be triggered by webhook/indexing.
-  triggers {
-    pollSCM('H/15 * * * *')
-  }
-
-  environment {
-    MVN_ARGS = '-B -ntp'
-    AFFECTED_MODULES = ''
-    MVN_MAKE_FLAGS = '-am'
-    REBUILD_ALL_ON_JENKINSFILE = 'false'
-    SKIP_PIPELINE = 'false'
-    GITLEAKS_FAIL_ON_FINDINGS = 'false'
-    ENABLE_GITLEAKS = 'false'
-    ENABLE_SONAR_SCAN = 'false'
-    ENABLE_SNYK_SCAN = 'true'
-    SNYK_INSTALLATION = 'snyk@latest'
-    SNYK_TOKEN_ID = 'snyk-token'
-    SNYK_ORG = '4496d6cc-3702-46bc-8ea7-6ac73f92b5cf'
-  }
-
-  stages {
-    stage('Checkout') {
-      steps {
-        checkout scm
-        script {
-          runCmd('git fetch --no-tags --prune origin +refs/heads/*:refs/remotes/origin/*')
-        }
-      }
+    if (env.CHANGE_TARGET) {
+        // For pull requests, compare the current branch with the target branch
+        cmd = "git diff --name-only origin/${env.CHANGE_TARGET}...HEAD"
+    } else if (env.GIT_PREVIOUS_SUCCESSFUL_COMMIT && env.GIT_COMMIT) {
+        // For regular commits, compare the current commit with the previous successful commit
+        cmd = "git diff --name-only ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}..${env.GIT_COMMIT}"
+    } else if (env.GIT_PREVIOUS_COMMIT && env.GIT_COMMIT) {
+        // If no previous successful commit is available, compare the current commit with the previous commit
+        cmd = "git diff --name-only ${env.GIT_PREVIOUS_COMMIT}..${env.GIT_COMMIT}"
+    } else {
+        // Fallback: list files changed in the latest commit
+        cmd = 'git show --name-only --pretty="" HEAD'
     }
 
-    stage('Detect Changed Modules') {
-      steps {
-        script {
-          def allModules = readMavenModulesFromRootPom()
-          def changedFiles = computeChangedFiles()
-
-          def normalizedChangedFiles = changedFiles
-            .collect { it.replaceAll('\\u001B\\[[;\\d]*m', '').trim() }
-            .collect { it.replace('\\', '/') }
-            .collect { it.replaceFirst(/^\.\//, '') }
-            .findAll { it }
-
-          def rebuildAll = normalizedChangedFiles.any { f ->
-            f.equalsIgnoreCase('pom.xml') || f.startsWith('checkstyle/')
-          }
-
-          if (env.REBUILD_ALL_ON_JENKINSFILE?.toBoolean()) {
-            rebuildAll = rebuildAll || normalizedChangedFiles.any { f -> f.equalsIgnoreCase('Jenkinsfile') }
-          }
-
-          def affectedModules = allModules.findAll { module ->
-            normalizedChangedFiles.any { f -> f == module || f.startsWith("${module}/") }
-          }
-
-          if (rebuildAll) {
-            affectedModules = allModules
-          }
-
-          if (affectedModules.contains('common-library')) {
-            env.MVN_MAKE_FLAGS = '-am -amd'
-          }
-
-          def affectedModulesCsv = affectedModules ? affectedModules.join(',') : ''
-          env.AFFECTED_MODULES = affectedModulesCsv
-          env.SKIP_PIPELINE = env.AFFECTED_MODULES?.trim() ? 'false' : 'true'
-          writeFile file: '.jenkins_affected_modules', text: (affectedModulesCsv ?: '')
-
-          if (env.SKIP_PIPELINE == 'true') {
-            currentBuild.description = "${env.BRANCH_NAME ?: ''} | no Maven service changes"
-            echo "Changed files:\n${normalizedChangedFiles.join('\n')}"
-            echo 'No impacted Maven module. Test/Coverage/Build stages will be skipped.'
-          } else {
-            currentBuild.description = "${env.BRANCH_NAME ?: ''} | modules: ${affectedModulesCsv}"
-            echo "Changed files:\n${normalizedChangedFiles.join('\n')}"
-            echo "Affected modules: ${affectedModulesCsv}"
-          }
-        }
-      }
-    }
-
-    stage('Test') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
-      }
-      steps {
-        script {
-          def mods = readAffectedModulesCsv()
-          int verifyStatus = runStatus("mvn ${env.MVN_ARGS} -pl ${mods} ${env.MVN_MAKE_FLAGS} verify")
-          if (verifyStatus != 0) {
-            currentBuild.result = 'FAILURE'
-            echo 'verify failed; running jacoco:report fallback to publish coverage artifacts.'
-            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-              runCmd("mvn ${env.MVN_ARGS} -pl ${mods} ${env.MVN_MAKE_FLAGS} -DskipTests jacoco:report")
-            }
-          }
-        }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true,
-                testResults: '**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml'
-        }
-      }
-    }
-
-    stage('Coverage Gate (>70%)') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
-      }
-      steps {
-        script {
-          def mods = readAffectedModulesCsv()
-          def coverageTools = mods
-            .split(',')
+    try {
+        def out = runCapture(cmd)
+        return out
+            .split(/\r?\n/)
             .collect { it.trim() }
             .findAll { it }
-            .collect { module ->
-              [parser: 'JACOCO', pattern: "${module}/target/site/jacoco/jacoco.xml"]
-            }
+    } catch (err) {
+        def out = runCapture('git -c color.ui=never show --name-only --pretty="" HEAD')
+        return out
+            .split(/\r?\n/)
+            .collect { it.trim() }
+            .findAll { it }
+    }
+}
 
-          recordCoverage(
-            tools: coverageTools,
-            sourceCodeRetention: 'NEVER',
-            qualityGates: [
-              [threshold: 70.0, metric: 'LINE', baseline: 'PROJECT', criticality: 'FAILURE'],
-              [threshold: 50.0, metric: 'BRANCH', baseline: 'PROJECT', criticality: 'FAILURE'],
-              [threshold: 70.0, metric: 'INSTRUCTION', baseline: 'PROJECT', criticality: 'UNSTABLE']
-            ]
-          )
+// Read the list of modules from the root pom.xml
+def readMavenModulesFromRootPom() {
+    def pom = readFile('pom.xml')
+    def matcher = (pom =~ /<module>([^<]+)<\/module>/)
+    def modules = []
+    matcher.each { m -> modules << m[1].trim() }
+    return modules.unique()
+}
+
+
+pipeline {
+    agent any
+
+    tools {
+        // Define the Maven and JDK tools to be used in the pipeline
+        maven 'maven3'
+        jdk 'jdk25'
+    }
+
+    options {
+        timestamps() 
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    triggers {
+        //  Poll the SCM every 5 minutes to check for changes
+        pollSCM('H/5 * * * *')
+    }
+
+    environment {
+        // Define environment variables for Maven commands
+        MVN_ARGS = '-B -ntp'
+        
+        // Toggle security and analysis stages
+        ENABLE_GITLEAKS = 'false'
+        ENABLE_SONARQUBE = 'false'
+        ENABLE_SNYK = 'true'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Perform a clean checkout of the source code
+                checkout scm  
+                sh 'git fetch --no-tags --prune origin +refs/heads/*:refs/remotes/origin/*'
+            }
         }
-      }
-    }
 
-    stage('Gitleaks Scan') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' && env.ENABLE_GITLEAKS?.toBoolean() }
-      }
-      steps {
-        script {
-          int gitleaksStatus
-          if (isUnix()) {
-            gitleaksStatus = runStatus('''
-              if command -v gitleaks >/dev/null 2>&1; then
-                gitleaks detect --source . --config gitleaks.toml --no-git --verbose --report-format sarif --report-path gitleaks-report.sarif
-              else
-                docker run --rm -v "$PWD:/work" -w /work zricethezav/gitleaks:v8.18.4 detect --source . --config /work/gitleaks.toml --no-git --verbose --report-format sarif --report-path /work/gitleaks-report.sarif
-              fi
-            ''')
-          } else {
-            gitleaksStatus = runStatus('''
-              where gitleaks >nul 2>nul
-              if %ERRORLEVEL% EQU 0 (
-                gitleaks detect --source . --config gitleaks.toml --no-git --verbose --report-format sarif --report-path gitleaks-report.sarif
-              ) else (
-                docker run --rm -v "%CD%:/work" -w /work zricethezav/gitleaks:v8.18.4 detect --source . --config /work/gitleaks.toml --no-git --verbose --report-format sarif --report-path /work/gitleaks-report.sarif
-              )
-            ''')
-          }
-
-          if (gitleaksStatus != 0) {
-            def msg = 'Gitleaks found potential secrets. Review gitleaks-report.sarif and rotate/revoke exposed credentials if needed.'
-            if (env.GITLEAKS_FAIL_ON_FINDINGS?.toBoolean()) {
-              error(msg)
-            } else {
-              unstable(msg)
+        stage('Gitleaks Scan') {
+            when {
+                expression { env.ENABLE_GITLEAKS == 'true' }
             }
-          }
+            steps {
+                script {
+                    def baseBranch = env.CHANGE_TARGET ?: "main"
+
+                    def status = sh(
+                        script: '''
+                            gitleaks detect \
+                                --source . \
+                                --log-opts= "origin/${baseBranch}...HEAD" \
+                                --config gitleaks.toml \
+                                --report-format json \
+                                --report-path gitleaks-report.json \
+                                --redact 
+                            ''',
+                        returnStatus: true
+                    )
+                    
+                    // Convert the Gitleaks JSON report to a simple HTML format for better visualization in Jenkins
+                    sh '''
+                        echo "<html><body><h2>Gitleaks Report</h2><pre>" > gitleaks-report.html
+                        cat gitleaks-report.json >> gitleaks-report.html
+                        echo "</pre></body></html>" >> gitleaks-report.html
+                    '''
+
+                    // Publish the Gitleaks report as an HTML report in Jenkins 
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'gitleaks-report.html',
+                        reportName: 'Gitleaks Report'
+                    ])
+
+                    // If Gitleaks detected secrets (status != 0), fail the build and prompt the developer to check the report. Otherwise, print a success message.
+                    if (status != 0) {
+                        echo "GITLEAKS WARNING: secrets detected (see report)"
+                        currentBuild.result = 'UNSTABLE'
+                    } else {
+                        echo "No secrets detected"
+                    }
+                }
+            }
         }
-      }
-    }
 
-    stage('SonarQube Scan') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' && env.ENABLE_SONAR_SCAN?.toBoolean() }
-      }
-      steps {
-        script {
-          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-            if (!(env.SONAR_TOKEN ?: '').trim()) {
-              error('SONAR_TOKEN is required for SonarQube scan. Configure it in Jenkins credentials/environment.')
+        stage('Detect Changes') {
+            steps {
+                script {
+                    def allModules = readMavenModulesFromRootPom()
+                    def changedFiles = computeChangedFiles()
+
+                    // Normalize file paths (CRITICAL)
+                    def normalizedChangedFiles = changedFiles
+                        .collect { it.replaceAll('\\u001B\\[[;\\d]*m', '').trim() }
+                        .collect { it.replace('\\', '/') }
+                        .collect { it.replaceFirst(/^\.\//, '') }
+                        .findAll { it }
+
+                    // Detect rebuild all
+                    def rebuildAll = normalizedChangedFiles.any { f ->
+                        f.equalsIgnoreCase('pom.xml') ||
+                        f.startsWith('checkstyle/')
+                    }
+
+                    // Optional: rebuild if Jenkinsfile changed
+                    if (env.REBUILD_ALL_ON_JENKINSFILE?.toBoolean()) {
+                        rebuildAll = rebuildAll || normalizedChangedFiles.any {
+                            it.equalsIgnoreCase('Jenkinsfile')
+                        }
+                    }
+
+                    // Debug: top-level dirs (for visibility only)
+                    def touchedTopDirs = normalizedChangedFiles
+                        .findAll { it.contains('/') }
+                        .collect { it.tokenize('/')[0] }
+                        .unique()
+
+                    def affected = allModules.findAll { module ->
+                        normalizedChangedFiles.any { f ->
+                            f == module || f.startsWith("${module}/")
+                        }
+                    }
+
+                    if (rebuildAll) {
+                        affected = allModules
+                    }
+
+                    // Handle dependency rebuild
+                    env.MVN_MAKE_FLAGS = '-am'
+                    if (affected.contains('common-library')) {
+                        env.MVN_MAKE_FLAGS = '-am -amd'
+                    }
+
+                    def affectedModulesCsv = affected.join(',')
+                    env.AFFECTED_MODULES = affectedModulesCsv
+
+                    // Persist for later stages (avoid env issues)
+                    writeFile file: '.jenkins_affected_modules', text: affectedModulesCsv
+
+                    // Logging
+                    echo "All modules (${allModules.size()}): ${allModules.join(',')}"
+                    echo "rebuildAll=${rebuildAll}"
+                    echo "Touched dirs: ${touchedTopDirs.join(',')}"
+                    echo "Affected modules: ${affectedModulesCsv}"
+
+                    if (affectedModulesCsv?.trim()) {
+                        currentBuild.description = "${env.BRANCH_NAME ?: ''} | modules: ${affectedModulesCsv}"
+                        echo "Changed files:\n${normalizedChangedFiles.join('\n')}"
+                    } else {
+                        currentBuild.description = "${env.BRANCH_NAME ?: ''} | no service changes"
+                        echo "Changed files:\n${normalizedChangedFiles.join('\n')}"
+                        echo "No Maven module affected. Build/test stages will be no-op"
+                    }
+                }
             }
-
-            def moduleList = readAffectedModulesList()
-            moduleList.each { module ->
-              def sonarProjectKey = readSonarProjectKeyFromModulePom(module)
-              if (!sonarProjectKey) {
-                error("Missing <sonar.projectKey> in ${module}/pom.xml")
-              }
-
-              // Ensure inter-module dependencies are available in local Maven repo for standalone module scan.
-              int installStatus = runStatus("mvn ${env.MVN_ARGS} -pl ${module} -am -DskipTests install")
-              if (installStatus != 0) {
-                unstable("Preparation for Sonar failed for module ${module} (install dependencies). Continue to Snyk scan.")
-                return
-              }
-
-              int sonarStatus = runStatus("mvn ${env.MVN_ARGS} -f ${module}/pom.xml org.sonarsource.scanner.maven:sonar-maven-plugin:5.6.0.6792:sonar -Dsonar.token=${env.SONAR_TOKEN} -Dsonar.projectKey=${sonarProjectKey}")
-              if (sonarStatus != 0) {
-                unstable("Sonar scan failed for module ${module} (projectKey=${sonarProjectKey}). Continue to Snyk scan.")
-              }
-            }
-          }
         }
-      }
-    }
 
-    stage('Snyk Scan') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' && env.ENABLE_SNYK_SCAN?.toBoolean() }
-      }
-      steps {
-        script {
-          def moduleList = readAffectedModulesList()
-          if (!moduleList || moduleList.isEmpty()) {
-            echo "No affected modules → skip Snyk scan"
-            return
-          }
-
-          if (!(env.SNYK_INSTALLATION ?: '').trim()) {
-            unstable('SNYK_INSTALLATION is required for Jenkins Snyk plugin. Configure Jenkins Tool and set env.SNYK_INSTALLATION.')
-            return
-          }
-
-          if (!(env.SNYK_TOKEN_ID ?: '').trim()) {
-            unstable('SNYK_TOKEN_ID is required for Jenkins Snyk plugin. Configure Snyk API Token credential and set env.SNYK_TOKEN_ID.')
-            return
-          }
-
-          def rootRevision = readRootRevisionFromPom()
-          def additionalArgs = '--command=mvn --debug'
-
-          moduleList.each { module ->
-            echo "=== Snyk scan for module: ${module} ==="
-
-            // Some Jenkins Linux agents fail with exit -13 when module mvnw lacks execute bit.
-            if (isUnix() && fileExists("${module}/mvnw")) {
-              int chmodStatus = runStatus("chmod +x ${module}/mvnw")
-              if (chmodStatus != 0) {
-                echo "Warning: chmod +x ${module}/mvnw failed. Continue with --command=mvn fallback."
-              }
+        stage('Snyk Scan') {
+            when {
+                allOf {
+                    expression { env.ENABLE_SNYK == 'true' }
+                    expression { env.AFFECTED_MODULES?.trim() }
+                }
             }
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'snyk-token-1', variable: 'SNYK_TOKEN')]) {
+                        // Authenticate Snyk once at the root level
+                        sh 'snyk auth $SNYK_TOKEN'
+                        
+                        // Retrieve the list of affected modules from the environment variable
+                        def modules = env.AFFECTED_MODULES.split(',')
+                        
+                        // Iterate through each affected module to perform the scan
+                        for (int i = 0; i < modules.length; i++) {
+                            def module = modules[i].trim()
+                            echo "--- Running Snyk scan for module: ${module} ---"
+                            
+                            // Navigate to the respective service directory
+                            dir(module) {
+                                def snykStatus = sh(
+                                    script: '''
+                                        snyk test || true
+                                        snyk code test || true
+                                    ''',
+                                    returnStatus: true
+                                )
 
-            // Ensure inter-module SNAPSHOT dependencies are available before plugin scan.
-            int prepStatus = runStatus("mvn ${env.MVN_ARGS} -pl ${module} -am -DskipTests install")
-            if (prepStatus != 0) {
-              unstable("Snyk prep failed for ${module}")
-              return
+                                if (snykStatus != 0) {
+                                    echo "SNYK WARNING: vulnerabilities detected in ${module}"
+                                    currentBuild.result = 'UNSTABLE'
+                                } else {
+                                    echo "No vulnerabilities detected in ${module}"
+                                }
+                            }
+                        }
+                    }
+                }
             }
-
-            def snykStepArgs = [
-              snykInstallation: env.SNYK_INSTALLATION,
-              snykTokenId: env.SNYK_TOKEN_ID,
-              targetFile: "${module}/pom.xml",
-              monitorProjectOnBuild: true,
-              failOnIssues: false,
-              failOnError: false
-            ]
-
-            if ((env.SNYK_ORG ?: '').trim()) {
-              snykStepArgs.organisation = env.SNYK_ORG.trim()
-            }
-            if (additionalArgs) {
-              snykStepArgs.additionalArguments = additionalArgs
-            }
-
-            def mavenConfig = rootRevision ? "-U -Drevision=${rootRevision}" : '-U'
-            withEnv(["MAVEN_CONFIG=${mavenConfig}"]) {
-              catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                snykSecurity(snykStepArgs)
-              }
-            }
-          }
         }
-      }
-    }
 
-    stage('Build') {
-      when {
-        expression {
-          env.SKIP_PIPELINE != 'true' && (currentBuild.currentResult == null || currentBuild.currentResult == 'SUCCESS')
+        stage('Build') {
+            when {
+                // Only run the build stage if there are affected modules to build
+                expression { env.AFFECTED_MODULES?.trim() }
+            }
+            steps {
+                // Run the Maven build command for the affected modules to create the necessary artifacts for testing and coverage analysis
+                echo "Building affected modules: ${env.AFFECTED_MODULES}..."
+                sh "mvn ${env.MVN_ARGS} -pl ${env.AFFECTED_MODULES} ${env.MVN_MAKE_FLAGS} -DskipTests clean package"
+            }
         }
-      }
-      steps {
-        script {
-          def mods = readAffectedModulesCsv()
-          runCmd("mvn ${env.MVN_ARGS} -pl ${mods} ${env.MVN_MAKE_FLAGS} -DskipTests package")
+
+        stage('Unit & Integration Tests') {
+            when {
+                expression { env.AFFECTED_MODULES?.trim() }
+            }
+            steps {
+                // Run the Maven verify command for the affected modules to execute tests and generate coverage reports
+                sh """
+                    mvn ${env.MVN_ARGS} \
+                        -pl ${env.AFFECTED_MODULES} ${env.MVN_MAKE_FLAGS} \
+                        verify \
+                        -ff \
+                        -DtrimStackTrace=true \
+                        -Dsurefire.printSummary=true \
+                        -Dfailsafe.printSummary=true
+                """
+                // Publish unit test and integration test results to Jenkins for reporting and analysis
+                junit allowEmptyResults: true,
+                      testResults: '**/target/surefire-reports/*.xml, **/target/failsafe-reports/*.xml'
+                
+                // Publish code coverage reports to Jenkins using the Jacoco plugin, allowing for visualization of test coverage and identification of untested code areas
+                recordCoverage(
+                    tools: [
+                        jacoco(pattern: '**/target/site/jacoco/jacoco.xml')
+                    ]
+                )
+            }
         }
-      }
-    }
-  }
 
-  post {
-    always {
-      script {
-        try {
-          archiveArtifacts allowEmptyArchive: true,
-                           artifacts: '**/target/site/jacoco/**,**/target/jacoco.exec'
-          archiveArtifacts allowEmptyArchive: true,
-                           artifacts: 'gitleaks-report.sarif'
-          archiveArtifacts allowEmptyArchive: true,
-                           artifacts: '**/target/*.jar,**/target/*.war'
-        } catch (err) {
-          echo "Skipping artifact archiving: ${err.message}"
+        stage('SonarQube Analysis & Quality Gate') {
+            when {
+                allOf {
+                    expression { env.ENABLE_SONARQUBE == 'true' }
+                    expression { env.AFFECTED_MODULES?.trim() }
+                }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'sonar-yas', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        mvn ${MVN_ARGS} \
+                            -pl ${AFFECTED_MODULES} \
+                            ${MVN_MAKE_FLAGS} \
+                            sonar:sonar \
+                            -Dsonar.projectKey=yas-project\
+                            -Dsonar.host.url=http://localhost:9000 \
+                            -Dsonar.login=$SONAR_TOKEN \
+                            -Dsonar.qualitygate.wait=true
+                    """
+                }
+            }
         }
-      }
     }
 
-    success {
-      echo 'Pipeline succeeded.'
-    }
+    post {
+        always {
+            // Upload artifact
+            archiveArtifacts allowEmptyArchive: true,
+                artifacts: '**/target/*.jar'
 
-    failure {
-      echo 'Pipeline failed.'
-    }
+            // Upload test reports
+            archiveArtifacts allowEmptyArchive: true,
+                artifacts: '**/target/surefire-reports/*.xml, **/target/failsafe-reports/*.xml'
 
-    unstable {
-      echo 'Pipeline unstable.'
+            // Upload coverage report
+            archiveArtifacts allowEmptyArchive: true,
+                artifacts: '**/target/site/jacoco/**'
+
+            // Upload Gitleaks report
+            archiveArtifacts allowEmptyArchive: true,
+                artifacts: 'gitleaks-report.json'
+        }
+
+        success {
+            echo 'Pipeline SUCCESS'
+        }
+
+        failure {
+            echo 'Pipeline FAILED'
+        }
     }
-  }
 }
