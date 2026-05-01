@@ -282,6 +282,7 @@ pipeline {
                                             --package-manager=maven \
                                             --org=$SNYK_ORG \
                                             --severity-threshold=low
+                                            -- -Drevision=$REVISION
                                     ''',
                                     returnStatus: true
                                 )
