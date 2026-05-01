@@ -259,6 +259,8 @@ pipeline {
                             echo "Done fixing mvnw permissions"
                         """
 
+                        sh 'snyk test'
+
                         for (module in modules) {
                             module = module.trim()
                             if (!module) continue
@@ -281,7 +283,7 @@ pipeline {
                                             --file=pom.xml \
                                             --package-manager=maven \
                                             --org=$SNYK_ORG \
-                                            --severity-threshold=low
+                                            --severity-threshold=low \
                                             -- -Drevision=$REVISION
                                     ''',
                                     returnStatus: true
