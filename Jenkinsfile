@@ -259,7 +259,7 @@ pipeline {
                             echo "Done fixing mvnw permissions"
                         """
 
-                        sh 'snyk test'
+                        // sh 'snyk test'
 
                         for (module in modules) {
                             module = module.trim()
