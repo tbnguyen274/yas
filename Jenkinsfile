@@ -253,6 +253,7 @@ pipeline {
                                 def depStatus = sh(
                                     script: '''
                                         snyk test \
+                                            -d \
                                             --file=pom.xml \
                                             --package-manager=maven \
                                             --org=$SNYK_ORG \
