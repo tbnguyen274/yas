@@ -277,15 +277,9 @@ pipeline {
                                 '''
 
                                 def depStatus = sh(
-                                    script: '''
-                                        snyk test \
-                                            -d \
-                                            --file=pom.xml \
-                                            --package-manager=maven \
-                                            --org=$SNYK_ORG \
-                                            --severity-threshold=low \
-                                            -- -Drevision=$REVISION
-                                    ''',
+                                    script: """
+                                        snyk test -d --file=pom.xml --package-manager=maven --org=${env.SNYK_ORG} --severity-threshold=low -- -Drevision=${env.REVISION}
+                                    """,
                                     returnStatus: true
                                 )
 
