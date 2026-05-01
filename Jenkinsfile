@@ -65,8 +65,6 @@ pipeline {
     environment {
         // Define environment variables for Maven commands
         MVN_ARGS = '-B -ntp'
-        SNYK_ORG = '4496d6cc-3702-46bc-8ea7-6ac73f92b5cf'
-        REVISION = '1.0-SNAPSHOT'
     }
 
     stages {
@@ -203,6 +201,10 @@ pipeline {
             when {
                 expression { env.AFFECTED_MODULES?.trim() }
             }
+            environment {
+                SNYK_ORG = '4496d6cc-3702-46bc-8ea7-6ac73f92b5cf'
+                REVISION = '1.0-SNAPSHOT'
+            }
             steps {
                 script {
                     withCredentials([string(credentialsId: 'snyk', variable: 'SNYK_TOKEN')]) {
@@ -232,13 +234,30 @@ pipeline {
                         // }
 
                         sh """
-                            mvn -q \
+                            if [ -f "mvnw" ]; then
+                                chmod +x mvnw
+                                MVN=./mvnw
+                            else
+                                MVN=mvn
+                            fi
+
+                            echo "Using Maven: \$MVN"
+
+                            \$MVN -q \
                                 -Drevision=${env.REVISION} \
                                 -DskipTests \
                                 -pl ${moduleList} \
                                 -am \
                                 clean install
                         """
+
+                        sh '''
+                            echo "Fixing mvnw permissions..."
+
+                            find . -name "mvnw" -type f -exec chmod +x {} \;
+
+                            echo "Done fixing mvnw permissions"
+                        '''
 
                         for (module in modules) {
                             module = module.trim()
@@ -249,6 +268,11 @@ pipeline {
                             dir(module) {
 
                                 // sh 'mvn -q -DskipTests clean install'
+                                sh '''
+                                    if [ -f "mvnw" ]; then
+                                        chmod +x mvnw
+                                    fi
+                                '''
 
                                 def depStatus = sh(
                                     script: '''
