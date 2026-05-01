@@ -204,6 +204,7 @@ pipeline {
             environment {
                 SNYK_ORG = '4496d6cc-3702-46bc-8ea7-6ac73f92b5cf'
                 REVISION = '1.0-SNAPSHOT'
+                AFFECTED_MODULES = 'media' // hardcoded for testing - replace with env var in production
             }
             steps {
                 script {
