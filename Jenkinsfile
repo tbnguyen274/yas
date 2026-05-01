@@ -211,23 +211,23 @@ pipeline {
                         '''
 
                         def modules = env.AFFECTED_MODULES.split(',')
-                        def moduleList = modules.collect { it.trim() }.findAll { it }.join(',')
-                        echo "Running Snyk scan for affected modules: ${moduleList}"
+                        // def moduleList = modules.collect { it.trim() }.findAll { it }.join(',')
+                        // echo "Running Snyk scan for affected modules: ${moduleList}"
 
-                        withEnv(["MODULES=${moduleList}"]) {
+                        // withEnv(["MODULES=${moduleList}"]) {
 
-                            sh '''
-                                if [ -f "mvnw" ]; then
-                                    chmod +x mvnw
-                                    MVN=./mvnw
-                                else
-                                    MVN=mvn
-                                fi
+                        //     sh '''
+                        //         if [ -f "mvnw" ]; then
+                        //             chmod +x mvnw
+                        //             MVN=./mvnw
+                        //         else
+                        //             MVN=mvn
+                        //         fi
 
-                                echo "Using Maven: $MVN"
-                                $MVN -pl $MODULES -am clean install -DskipTests
-                            '''
-                        }
+                        //         echo "Using Maven: $MVN"
+                        //         $MVN -pl $MODULES -am clean install -DskipTests
+                        //     '''
+                        // }
 
                         for (module in modules) {
                             module = module.trim()
@@ -237,13 +237,15 @@ pipeline {
 
                             dir(module) {
 
+                                sh 'mvn -q -DskipTests clean install'
+
                                 def depStatus = sh(
-                                    script: 'snyk test --file=pom.xml --org=$SNYK_ORG --severity-threshold=high',
+                                    script: 'snyk test --file=pom.xml --package-manager=maven --org=$SNYK_ORG --severity-threshold=low',
                                     returnStatus: true
                                 )
 
                                 def codeStatus = sh(
-                                    script: 'snyk code test --org=$SNYK_ORG --severity-threshold=high',
+                                    script: 'snyk code test --org=$SNYK_ORG --severity-threshold=low',
                                     returnStatus: true
                                 )
 
