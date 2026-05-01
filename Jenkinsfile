@@ -66,6 +66,7 @@ pipeline {
         // Define environment variables for Maven commands
         MVN_ARGS = '-B -ntp'
         SNYK_ORG = '4496d6cc-3702-46bc-8ea7-6ac73f92b5cf'
+        REVISION = '1.0-SNAPSHOT'
     }
 
     stages {
@@ -211,8 +212,9 @@ pipeline {
                         '''
 
                         def modules = env.AFFECTED_MODULES.split(',')
-                        // def moduleList = modules.collect { it.trim() }.findAll { it }.join(',')
-                        // echo "Running Snyk scan for affected modules: ${moduleList}"
+                        def moduleList = modules.collect { it.trim() }.findAll { it }.join(',')
+                        
+                        echo "Building modules before Snyk scan: ${moduleList}"
 
                         // withEnv(["MODULES=${moduleList}"]) {
 
@@ -229,6 +231,15 @@ pipeline {
                         //     '''
                         // }
 
+                        sh """
+                            mvn -q \
+                                -Drevision=${env.REVISION} \
+                                -DskipTests \
+                                -pl ${moduleList} \
+                                -am \
+                                clean install
+                        """
+
                         for (module in modules) {
                             module = module.trim()
                             if (!module) continue
@@ -237,15 +248,25 @@ pipeline {
 
                             dir(module) {
 
-                                sh 'mvn -q -DskipTests clean install'
+                                // sh 'mvn -q -DskipTests clean install'
 
                                 def depStatus = sh(
-                                    script: 'snyk test --file=pom.xml --package-manager=maven --org=$SNYK_ORG --severity-threshold=low',
+                                    script: '''
+                                        snyk test \
+                                            --file=pom.xml \
+                                            --package-manager=maven \
+                                            --org=$SNYK_ORG \
+                                            --severity-threshold=low
+                                    ''',
                                     returnStatus: true
                                 )
 
                                 def codeStatus = sh(
-                                    script: 'snyk code test --org=$SNYK_ORG --severity-threshold=low',
+                                    script: '''
+                                        snyk code test \
+                                            --org=$SNYK_ORG \
+                                            --severity-threshold=low
+                                    ''',
                                     returnStatus: true
                                 )
 
