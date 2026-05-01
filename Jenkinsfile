@@ -251,13 +251,13 @@ pipeline {
                                 clean install
                         """
 
-                        sh '''
+                        sh """
                             echo "Fixing mvnw permissions..."
 
-                            find . -name "mvnw" -type f -exec chmod +x {} \;
+                            find . -name "mvnw" -type f -exec chmod +x {} \\;
 
                             echo "Done fixing mvnw permissions"
-                        '''
+                        """
 
                         for (module in modules) {
                             module = module.trim()
